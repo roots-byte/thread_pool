@@ -478,14 +478,18 @@ static inline void* PoolWorker(void* arg)
                                 break; // not yet timed out
                             }
                             //go to error status block (timed out)
+                            #ifndef _WIN32
                             __attribute__((fallthrough));
+                            #endif
                         case THREAD_WORKER_STATUS_INIT:
                             fprintf(stderr, "[thread_pool] PoolWorker: worker thread %d timed out (status=%d), attempting recovery\n", worker_inx, worker_status);
                             sleep_ms(MAX_RUNNING_TASK_TIME_MS);
                             worker_status = atomic_int_get(&pool->threads[worker_inx]->thread_status);
                             if (worker_status != THREAD_WORKER_STATUS_INIT && worker_status != THREAD_WORKER_STATUS_WORKING) break;
                             //go to error status block
+                            #ifndef _WIN32
                             __attribute__((fallthrough));
+                            #endif
                         case THREAD_WORKER_STATUS_ERROR:
                             DestroyThreadWorker(pool->threads[worker_inx]);
                             pool->threads[worker_inx] = CreateThreadWorker(pool);
