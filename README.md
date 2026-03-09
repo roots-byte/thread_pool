@@ -214,6 +214,7 @@ The example also shows how to:
 thread_pool_wrapper.h   Platform abstraction (threads, atomics, sleep, time)
 thread_pool.h           Public API — structs, constants, function declarations
 thread_pool.c           Implementation (all static inline — include directly)
+LICENSE
 example/
   test.c                Monte Carlo π demonstration
   thread_pool.c         Copy of the implementation (self-contained)
