@@ -62,7 +62,7 @@ static int get_num_cpus(int multiplier)
 
 #define THREAD_MULTIPLIER 1
 #define NUM_TASKS         1000
-#define SAMPLES_PER_TASK  1000000ULL
+#define SAMPLES_PER_TASK  100000ULL
 
 #define PROGRESS_POLL_SLEEP_MS 5
 
