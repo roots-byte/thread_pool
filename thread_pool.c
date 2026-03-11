@@ -25,7 +25,7 @@ static inline int WaitForValue(void* variable, int value, char atomic, int timeo
         if (variable == NULL)
         {
             fprintf(stderr, "[thread_pool] WaitForValue: variable is NULL\n");
-            return -2; // invalid variable
+            return -2;
         }
 
         if (atomic)
@@ -34,9 +34,9 @@ static inline int WaitForValue(void* variable, int value, char atomic, int timeo
             current_value = *(int*)variable;
 
         if (match && current_value == value)
-            return 0; // value matched
+            return 0;
         else if (!match && current_value != value)
-            return 0; // value not matched
+            return 0;
 
         sleep_ms(WAIT_FOR_VALUE_SLEEP_MS);
         elapsed = get_time_ms() - start_time;
@@ -47,8 +47,144 @@ static inline int WaitForValue(void* variable, int value, char atomic, int timeo
         }
     }
 
-    return -1; // timeout
+    return -1;
 }
+
+//Queue functions
+static inline task_queue_t* CreateTaskQueue(void)
+{
+    task_queue_t* queue = (task_queue_t*)malloc(sizeof(task_queue_t));
+    if (!queue) { fprintf(stderr, "[thread_pool] CreateTaskQueue: malloc failed\n"); return NULL; }
+    
+    atomic_int_set(&queue->capacity, QUEUE_CAPACITY);
+    queue->tasks = (atomic_ptr_t*)calloc(QUEUE_CAPACITY, sizeof(atomic_ptr_t));
+    if (!queue->tasks) { fprintf(stderr, "[thread_pool] CreateTaskQueue: malloc failed\n"); free(queue); return NULL; }
+    atomic_int_set(&queue->head, 0);
+    atomic_int_set(&queue->tail, 0);
+    atomic_int_set(&queue->running, 1);
+    mutex_init(&queue->mutex);
+    cond_init(&queue->cond);
+
+
+    return queue;
+}
+
+static inline void DestroyTaskQueue(task_queue_t* queue)
+{
+    if (queue == NULL) return;
+
+    cond_destroy(&queue->cond);
+    mutex_destroy(&queue->mutex);
+
+    if (queue->tasks)
+    {
+        for (int i = atomic_int_get(&queue->tail); i != atomic_int_get(&queue->head); i = (i + 1) % atomic_int_get(&queue->capacity))
+        {
+            void* ptr = atomic_ptr_get(&queue->tasks[i]);
+            if (ptr)
+                DestroyTask((task_t*)ptr);
+        }
+        free(queue->tasks);
+    }
+    free(queue);
+
+    queue = NULL;
+}
+
+static inline int ResizeTaskQueue(task_queue_t* queue)
+{
+    int old_capacity = atomic_int_get(&queue->capacity);
+    int new_capacity = old_capacity * 2;
+    atomic_ptr_t* new_tasks = (atomic_ptr_t*)calloc(new_capacity, sizeof(atomic_ptr_t));
+    if (!new_tasks)
+    {
+        fprintf(stderr, "[thread_pool] ResizeQueue: malloc failed\n");
+        return -1;
+    }
+
+    int head = atomic_int_get(&queue->head);
+    int tail = atomic_int_get(&queue->tail);
+    int size = (head >= tail) ? (head - tail) : (old_capacity - tail + head);
+
+    for (int i = 0; i < size; i++)
+    {
+        int index = (tail + i) % old_capacity;
+        void* task = atomic_ptr_get(&queue->tasks[index]);
+        atomic_ptr_set(&new_tasks[i], task);
+    }
+
+    free(queue->tasks);
+    queue->tasks = new_tasks;
+    atomic_int_set(&queue->capacity, new_capacity);
+    atomic_int_set(&queue->head, size);
+    atomic_int_set(&queue->tail, 0);
+
+    return 0;
+}
+
+static inline int EnqueueTask(task_queue_t* queue, task_t* task)
+{
+    if (!atomic_int_get(&queue->running))
+    {
+        return -1;
+    }
+    mutex_lock(&queue->mutex);
+    int size = atomic_int_get(&queue->capacity);
+    int head = atomic_int_get(&queue->head);
+    int tail = atomic_int_get(&queue->tail);
+
+    if ((head + 1) % size == tail)
+    {
+        if (ResizeTaskQueue(queue) != 0)
+        {
+            mutex_unlock(&queue->mutex);
+            return -1; // failed to resize
+        }
+        head = atomic_int_get(&queue->head);
+        tail = atomic_int_get(&queue->tail);
+        size = atomic_int_get(&queue->capacity);
+    }
+
+    atomic_ptr_set(&queue->tasks[head], task);
+    head = (head + 1) % size;
+    atomic_int_set(&queue->head, head);
+    atomic_int_set(&task->job_status, TASK_STATUS_IN_QUEUE);
+    mutex_unlock(&queue->mutex);
+
+    cond_signal(&queue->cond);
+    return 0;
+
+}
+
+static inline task_t* DequeueTask(task_queue_t* queue)
+{
+
+    if (!atomic_int_get(&queue->running))
+    {
+        return NULL;
+    }
+
+    mutex_lock(&queue->mutex);
+
+    int tail = atomic_int_get(&queue->tail);
+    int size = atomic_int_get(&queue->capacity);
+
+    void* task = atomic_ptr_set(&queue->tasks[tail], NULL);
+    if (task != NULL)
+    {
+        tail = (tail + 1) % size;
+        atomic_int_set(&queue->tail, tail);
+        mutex_unlock(&queue->mutex);
+        return (task_t*)task; // successfully dequeued
+    }
+        
+    mutex_unlock(&queue->mutex);
+
+    cond_broadcast(&queue->cond);
+
+    return NULL;
+}
+
 
 //Task functions
 
@@ -57,7 +193,7 @@ static inline task_t* CreateTask(void)
     task_t* task = (task_t*)malloc(sizeof(task_t));
     if (!task) { fprintf(stderr, "[thread_pool] CreateTask: malloc failed\n"); return NULL; }
 
-    atomic_int_set(&task->job_status, TASK_STATUS_CREATED); // inicializace job_status
+    atomic_int_set(&task->job_status, TASK_STATUS_CREATED);
     return task;
 }
 
@@ -65,16 +201,17 @@ static inline void DestroyTask(task_t* task)
 {
     if (task == NULL) return;
 
-    WaitForValue(&task->job_status, TASK_STATUS_RUNNING, 1, MAX_RUNNING_TASK_TIME_MS, 0);
+    int status = atomic_int_get(&task->job_status);
+    if (status == TASK_STATUS_RUNNING)
+    {
+        WaitForValue(&task->job_status, TASK_STATUS_RUNNING, 1, MAX_RUNNING_TASK_TIME_MS, 0);
+    }
 
     atomic_int_set(&task->job_status, TASK_STATUS_STOP);
-    sleep_ms(WAIT_FOR_VALUE_SLEEP_MS * 2);
     free(task);
 
 }
 
-// Wait until the worker function has signalled TASK_STATUS_FINISHED.
-// The user's worker_func MUST set job_status = TASK_STATUS_FINISHED on success.
 static inline int WaitForFinishTask(task_t* task)
 {
     if (task == NULL) { fprintf(stderr, "[thread_pool] WaitForFinishTask: task is NULL\n"); return -1; }
@@ -113,14 +250,13 @@ static inline pool_worker_t* CreateThreadWorker(pool_t* pool)
     worker->task = NULL;
     worker->start_time = 0;
     worker->pool = pool;
-
     init_pool_worker_t* init_data = worker->pool->init_data;
 
     if (init_data->worker_func == NULL)
     {
         fprintf(stderr, "[thread_pool] CreateThreadWorker: worker_func is NULL\n");
         free(worker);
-        return NULL; // no worker function defined
+        return NULL;
     }
 
     if (init_data->init_func)
@@ -129,7 +265,7 @@ static inline pool_worker_t* CreateThreadWorker(pool_t* pool)
         {
             fprintf(stderr, "[thread_pool] CreateThreadWorker: init_func failed\n");
             free(worker);
-            return NULL; // error during init
+            return NULL;
         }
     }
 
@@ -137,7 +273,7 @@ static inline pool_worker_t* CreateThreadWorker(pool_t* pool)
     {
         fprintf(stderr, "[thread_pool] CreateThreadWorker: thread_create failed\n");
         free(worker);
-        return NULL; // error creating thread
+        return NULL;
     }
 
     if (WaitForValue(&worker->thread_status, THREAD_WORKER_STATUS_IDLE, 1, MAX_RUNNING_TASK_TIME_MS, 1) != 0)
@@ -155,6 +291,8 @@ static inline pool_worker_t* CreateThreadWorker(pool_t* pool)
 static inline void DestroyThreadWorker(pool_worker_t* worker)
 {
     atomic_int_set(&worker->pool_status, THREAD_WORKER_SET_STOP);
+
+    cond_broadcast(&worker->pool->queue->cond);
 
     if (WaitForValue(&worker->thread_status, THREAD_WORKER_STATUS_STOP, 1, MAX_RUNNING_TASK_TIME_MS, 1) == 0)
     {
@@ -188,7 +326,7 @@ static inline void* PoolThreadWorker(void* arg)
     {
         fprintf(stderr, "[thread_pool] PoolThreadWorker: worker_func is NULL\n");
         atomic_int_set(&worker->thread_status, THREAD_WORKER_STATUS_ERROR);
-        return NULL; // no worker function defined
+        return NULL;
     }
 
     atomic_int_t* a_pool_order = &worker->pool_status;
@@ -199,16 +337,10 @@ static inline void* PoolThreadWorker(void* arg)
 
     while (pool_order != THREAD_WORKER_SET_STOP)
     {
-        if (pool_order == THREAD_WORKER_SET_OK)
-        {
-            goto while_end;
-        }
-
-        else if (pool_order == THREAD_WORKER_SET_DO_TASK)
+        if ((worker->task = DequeueTask(worker->pool->queue)) != NULL)
         {
             worker->start_time = get_time_ms();
 
-            // Mark task as running before calling the worker function
             atomic_int_set(&worker->task->job_status, TASK_STATUS_RUNNING);
             atomic_int_set(a_status, THREAD_WORKER_STATUS_WORKING);
             atomic_int_set(a_pool_order, THREAD_WORKER_SET_OK);
@@ -218,16 +350,19 @@ static inline void* PoolThreadWorker(void* arg)
                 fprintf(stderr, "[thread_pool] PoolThreadWorker: worker_func returned error\n");
                 atomic_int_set(&worker->task->job_status, TASK_STATUS_ERROR);
                 atomic_int_set(a_status, THREAD_WORKER_STATUS_ERROR);
-                return NULL; // error during work
+                return NULL;
             }
 
-            atomic_int_set(a_status, THREAD_WORKER_STATUS_IDLE); // ready for next task
+            atomic_int_set(a_status, THREAD_WORKER_STATUS_IDLE);
             worker->start_time = 0;
+            pool_order = atomic_int_get(a_pool_order);
+            continue;
         }
-
-        while_end:
-        sleep_ms(THREAD_SLEEP_TIME_MS);
-        pool_order = atomic_int_get(a_pool_order);
+        else
+        {
+            sleep_ms(1);
+            pool_order = atomic_int_get(a_pool_order);
+        }
     }
 
     atomic_int_set(a_status, THREAD_WORKER_STATUS_STOP);
@@ -243,9 +378,7 @@ static inline pool_t* CreatePool(int num_threads, init_pool_worker_t* init_data)
 
     atomic_int_set(&pool->status, POOL_STATUS_INIT);
     atomic_int_set(&pool->communication_status, POOL_SET_OK);
-    atomic_int_set(&pool->free_to_add_task, 1);
 
-    pool->task_to_add = NULL;
     pool->num_threads = num_threads;
     pool->init_data = init_data;
     pool->threads = (pool_worker_t**)calloc(num_threads, sizeof(pool_worker_t*));
@@ -254,15 +387,15 @@ static inline pool_t* CreatePool(int num_threads, init_pool_worker_t* init_data)
         fprintf(stderr, "[thread_pool] CreatePool: calloc failed for threads array\n");
         goto free_all;
     }
-    pool->queue_tasks = (task_t**)calloc(INITIAL_QUEUE_SIZE, sizeof(task_t*));
-    if (!pool->queue_tasks)
+   
+    pool->queue = CreateTaskQueue();
+    if (!pool->queue)
     {
-        fprintf(stderr, "[thread_pool] CreatePool: calloc failed for queue_tasks\n");
+        fprintf(stderr, "[thread_pool] CreatePool: CreateTaskQueue failed\n");
         goto free_all;
     }
-    pool->queue_size = INITIAL_QUEUE_SIZE;
 
-    pool->running_tasks = (task_t**)calloc(num_threads, sizeof(task_t*));
+    pool->running_tasks = (atomic_ptr_t*)calloc(num_threads, sizeof(atomic_ptr_t));
     if (!pool->running_tasks)
     {
         fprintf(stderr, "[thread_pool] CreatePool: calloc failed for running_tasks\n");
@@ -302,24 +435,10 @@ static inline pool_t* CreatePool(int num_threads, init_pool_worker_t* init_data)
 
     free_all:
     if (!pool) return NULL;
-    if (pool->queue_tasks) free(pool->queue_tasks);
+    if (pool->queue) DestroyTaskQueue(pool->queue);
     if (pool->running_tasks) free(pool->running_tasks);
     if (pool->thread) free(pool->thread);
-    if (pool->threads)
-    {
-        if (pool->threads[0]!= NULL)
-        {
-            for (int i = 0; i < num_threads; i++)
-            {
-                if (pool->threads[i])
-                {
-                    DestroyThreadWorker(pool->threads[i]);
-                    pool->threads[i] = NULL;
-                }
-            }
-        }
-        free(pool->threads);
-    }
+    if (pool->threads) free(pool->threads);
     free(pool);
     return NULL;
 }
@@ -348,38 +467,24 @@ static inline void DestroyPool(pool_t* pool)
         }
     }
 
-    if (pool->queue_tasks) free(pool->queue_tasks);
+    if (pool->queue) DestroyTaskQueue(pool->queue);
     if (pool->running_tasks) free(pool->running_tasks);
     if (pool->thread) free(pool->thread);
-    if (pool->threads)
-    {
-        if (pool->threads[0]!= NULL)
-        {
-            for (int i = 0; i < pool->num_threads; i++)
-            {
-                if (pool->threads[i])
-                {
-                    DestroyThreadWorker(pool->threads[i]);
-                    pool->threads[i] = NULL;
-                }
-            }
-        }
-        free(pool->threads);
-    }
+    if (pool->threads) free(pool->threads);
     free(pool);
     return;
 }
 
 static inline void* PoolWorker(void* arg)
 {
-    fprintf(stderr,"[thread_pool] PoolWorker: pool management thread started\n");
     pool_t* pool = (pool_t*)arg;
 
     atomic_int_t* a_status = &pool->status;
 
     atomic_int_set(a_status, POOL_STATUS_EMPTY);
     int status = atomic_int_get(&pool->communication_status);
-    fprintf(stderr, "[thread_pool] PoolWorker: initial pool communication status: %d\n", status);
+
+
     while (status != POOL_SET_STOP)
     {
         switch (status)
@@ -388,29 +493,14 @@ static inline void* PoolWorker(void* arg)
 
                 //clear tasks in queue
                 atomic_int_set(a_status, POOL_STATUS_OK);
-                for (int i = 0; i < pool->queue_size; i++)
+                atomic_int_set(&pool->queue->running, 0);
+
+                for (int i = atomic_int_get(&pool->queue->tail); i != atomic_int_get(&pool->queue->head); i = (i + 1) % atomic_int_get(&pool->queue->capacity))
                 {
-                    if (pool->queue_tasks[i])
+                    task_t* task = atomic_ptr_set(&pool->queue->tasks[i], NULL);
+                    if (task)
                     {
-                        DestroyTask(pool->queue_tasks[i]);
-                        pool->queue_tasks[i] = NULL;
-                    }
-                }
-
-                //clear tasks in add to queue
-                if (atomic_int_get(&pool->free_to_add_task) == 0)
-                {
-                    int is_value = 0;
-                    
-                    while (is_value == 0)
-                    {
-                        task_t* task_to_add = pool->task_to_add;
-                        pool->task_to_add = NULL;
-                        DestroyTask(task_to_add);
-
-                        atomic_int_set(&pool->free_to_add_task, 1);
-
-                        is_value = WaitForValue(&pool->free_to_add_task, 0, 1, SLEEP_FOR_ADD_TASK_TIME_MS * 10, 1);
+                        DestroyTask(task);
                     }
                 }
 
@@ -419,22 +509,35 @@ static inline void* PoolWorker(void* arg)
                 {
                     if (WaitForValue(&pool->threads[i]->thread_status, THREAD_WORKER_STATUS_WORKING, 1, MAX_RUNNING_TASK_TIME_MS, 0) == 0)
                     {
-                        DestroyTask(pool->running_tasks[i]);
-                        pool->running_tasks[i] = NULL;
+                        task_t* running_task = atomic_ptr_set(&pool->running_tasks[i], NULL);
+                        if (running_task)
+                        {
+                            DestroyTask(running_task);
+                        }
+                        atomic_int_set(&pool->threads[i]->pool_status, THREAD_WORKER_SET_OK);
+
                     }
                     else
                     {
+                        task_t* running_task = atomic_ptr_set(&pool->running_tasks[i], NULL);
                         DestroyThreadWorker(pool->threads[i]);
                         pool->threads[i] = CreateThreadWorker(pool);
-                        DestroyTask(pool->running_tasks[i]);
-                        pool->running_tasks[i] = NULL;
+                        if (running_task)
+                        {
+                            DestroyTask(running_task);
+                        }
+                        if (pool->threads[i])
+                            atomic_int_set(&pool->threads[i]->pool_status, THREAD_WORKER_SET_OK);
                     }
                     continue;
                 }
 
+                atomic_int_set(&pool->communication_status, POOL_SET_OK);
+                atomic_int_set(a_status, POOL_STATUS_EMPTY);
                 goto while_end;
             case POOL_SET_OK:
-                //handle threads
+            {
+
                 for (int worker_inx = 0, worker_status = 0; worker_inx < pool->num_threads; worker_inx++)
                 {
                     worker_status = atomic_int_get(&pool->threads[worker_inx]->thread_status);
@@ -443,31 +546,6 @@ static inline void* PoolWorker(void* arg)
                     switch (worker_status)
                     {
                         case THREAD_WORKER_STATUS_IDLE:
-                            // Guard against double-dispatch: if the pool already sent
-                            // DO_TASK but the worker hasn't set itself to WORKING yet,
-                            // it still looks IDLE. Skip it until it acknowledges.
-                            if (atomic_int_get(&pool->threads[worker_inx]->pool_status)
-                                    == THREAD_WORKER_SET_DO_TASK)
-                                break;
-                            if (atomic_int_get(a_status) != POOL_STATUS_EMPTY)
-                            {
-                                for (int task_inx = 0; task_inx < pool->queue_size; task_inx++)
-                                {
-                                    if (pool->queue_tasks[task_inx])
-                                    {
-                                        pool->threads[worker_inx]->task = pool->queue_tasks[task_inx];
-                                        pool->running_tasks[worker_inx] = pool->queue_tasks[task_inx];
-                                        pool->queue_tasks[task_inx] = NULL;
-
-                                        atomic_int_set(&pool->threads[worker_inx]->pool_status, THREAD_WORKER_SET_DO_TASK);
-                                        goto find_task;
-                                    }
-                                }
-
-                                atomic_int_set(a_status, POOL_STATUS_EMPTY);
-
-                                find_task: ;
-                            }
                             break;
                         case THREAD_WORKER_STATUS_WORKING:
                             worker_status = atomic_int_get(&pool->threads[worker_inx]->thread_status);
@@ -483,85 +561,42 @@ static inline void* PoolWorker(void* arg)
                             #endif
                         case THREAD_WORKER_STATUS_INIT:
                             fprintf(stderr, "[thread_pool] PoolWorker: worker thread %d timed out (status=%d), attempting recovery\n", worker_inx, worker_status);
-                            sleep_ms(MAX_RUNNING_TASK_TIME_MS);
-                            worker_status = atomic_int_get(&pool->threads[worker_inx]->thread_status);
-                            if (worker_status != THREAD_WORKER_STATUS_INIT && worker_status != THREAD_WORKER_STATUS_WORKING) break;
                             //go to error status block
                             #ifndef _WIN32
                             __attribute__((fallthrough));
                             #endif
                         case THREAD_WORKER_STATUS_ERROR:
+                            fprintf(stderr, "[thread_pool] PoolWorker: worker thread %d in error state, attempting recovery\n", worker_inx);
                             DestroyThreadWorker(pool->threads[worker_inx]);
                             pool->threads[worker_inx] = CreateThreadWorker(pool);
                             if (!pool->threads[worker_inx]) { fprintf(stderr, "[thread_pool] PoolWorker: failed to recreate worker thread %d\n", worker_inx); goto fatal_error; }
-                            pool->threads[worker_inx]->task = pool->running_tasks[worker_inx];
-                            atomic_int_set(&pool->threads[worker_inx]->pool_status, THREAD_WORKER_SET_DO_TASK);
-                            sleep_ms(MAX_RUNNING_TASK_TIME_MS);
-                            if (WaitForValue(&pool->threads[worker_inx]->thread_status, THREAD_WORKER_STATUS_IDLE, 1, MAX_RUNNING_TASK_TIME_MS, 1) != 0)
+                            if (WaitForValue(&pool->threads[worker_inx]->thread_status, THREAD_WORKER_STATUS_INIT, 1, MAX_RUNNING_TASK_TIME_MS, 1) != 0)
                             {
-                                fprintf(stderr, "[thread_pool] PoolWorker: recovered worker thread %d failed to become idle\n", worker_inx);
-                                DestroyTask(pool->running_tasks[worker_inx]);
-                                pool->running_tasks[worker_inx] = NULL;
+                                fprintf(stderr, "[thread_pool] PoolWorker: recreated worker thread %d did not initialize in time\n", worker_inx);
+                                DestroyThreadWorker(pool->threads[worker_inx]);
+                                pool->threads[worker_inx] = NULL;
                                 goto fatal_error;
+                            }
+                            if (atomic_ptr_get(&pool->running_tasks[worker_inx]) != NULL)
+                            {   
+                                pool->threads[worker_inx]->task = atomic_ptr_get(&pool->running_tasks[worker_inx]);
+                                atomic_int_set(&pool->threads[worker_inx]->pool_status, THREAD_WORKER_SET_DO_TASK);
+                                if (WaitForValue(&pool->threads[worker_inx]->thread_status, THREAD_WORKER_STATUS_IDLE, 1, MAX_RUNNING_TASK_TIME_MS, 1) != 0)
+                                {
+                                    fprintf(stderr, "[thread_pool] PoolWorker: recovered worker thread %d failed to become idle\n", worker_inx);
+                                    DestroyTask((task_t*)atomic_ptr_get(&pool->running_tasks[worker_inx]));
+                                    atomic_ptr_set(&pool->running_tasks[worker_inx], NULL);
+                                    goto fatal_error;
+                                }
                             }
                             break;
                         default:
                             break;
                     }
                 }
-                
-                //get data from add to  func to queue
-                int free_to_add = atomic_int_get(&pool->free_to_add_task);
-                if (free_to_add == 0)
-                {
-                    //int is_value = 0;
-                    
-                    //while (is_value == 0)
-                    //{
-                        task_t* task_to_add = pool->task_to_add;
-                        pool->task_to_add = NULL;
-
-                        for (int i = 0; i < pool->queue_size; i++)
-                        {
-                            if (!pool->queue_tasks[i])
-                            {
-                                pool->queue_tasks[i] = task_to_add;
-                                goto task_add;
-                            }
-                        }
-
-                        //no free space in queue
-                        int old_size = pool->queue_size;
-                        void* temp_ptr = (void*)realloc(pool->queue_tasks, old_size * 2 * sizeof(task_t*));
-                        if (temp_ptr == NULL)
-                        {
-                            fprintf(stderr, "[thread_pool] PoolWorker: realloc failed for queue_tasks (current size=%d)\n", old_size);
-                            goto fatal_error;
-                        }
-
-                        pool->queue_tasks = (task_t**)temp_ptr;
-                        memset(&pool->queue_tasks[old_size], 0, old_size * sizeof(task_t*));
-                        pool->queue_size = old_size * 2;
-
-                        //another try
-                        for (int i = 0; i < pool->queue_size; i++)
-                        {
-                            if (!pool->queue_tasks[i])
-                            {
-                                pool->queue_tasks[i] = task_to_add;
-                                goto task_add;
-                            }
-                        }
-
-                        task_add:
-                        atomic_int_cas(&pool->free_to_add_task, 0, 1);
-                        atomic_int_set(a_status, POOL_STATUS_OK);
-
-                        //is_value = WaitForValue(&pool->free_to_add_task, 0, 1, SLEEP_FOR_ADD_TASK_TIME_MS * 10, 1);
-                    //}
-                }
 
                 break;
+            } // end POOL_SET_OK
             default:
                 break;
 
@@ -571,7 +606,7 @@ static inline void* PoolWorker(void* arg)
         while_end:
         sleep_ms(POOL_LOOP_TIMEOUT_MS);
         status = atomic_int_get(&pool->communication_status);
-    }
+    } // end while
 
     atomic_int_set(&pool->status, POOL_STATUS_STOP);
     return NULL;
@@ -588,26 +623,15 @@ static inline int AddTaskToPool(pool_t* pool, task_t* task)
     if (atomic_int_get(&pool->communication_status) == POOL_SET_STOP)
     {
         fprintf(stderr, "[thread_pool] AddTaskToPool: pool is stopping, cannot add task\n");
-        return -1; // pool is stopping, cannot add task
+        return -1;
     }
 
-    uint32_t start_time = get_time_ms();
-
-    while (get_time_ms() - start_time < MAX_TIME_FOR_ADD_TASK)
+    if (EnqueueTask(pool->queue, task) == 0)
     {
-        if (atomic_int_cas(&pool->free_to_add_task, 1, 2)) // 2 = writing in progress
-        {
-            pool->task_to_add = task;
-            atomic_int_set(&task->job_status, TASK_STATUS_IN_QUEUE);
-            atomic_int_set(&pool->free_to_add_task, 0); // 0 = task ready for pool
-            return 0;
-        }
-        sleep_ms(SLEEP_FOR_ADD_TASK_TIME_MS);
+        return 0;
     }
-    
-    
     fprintf(stderr, "[thread_pool] AddTaskToPool: timeout waiting to add task\n");
-    return -1; // timeout
+    return -1;
 }
 
 static inline int ClearTasksInPool(pool_t* pool)
@@ -615,7 +639,7 @@ static inline int ClearTasksInPool(pool_t* pool)
     if (atomic_int_get(&pool->communication_status) == POOL_SET_STOP)
     {
         fprintf(stderr, "[thread_pool] ClearTasksInPool: pool is stopping, cannot clear tasks\n");
-        return -1; // pool is stopping, cannot clear tasks
+        return -1;
     }
 
     atomic_int_set(&pool->communication_status, POOL_SET_CLEAR_TASKS);
@@ -623,7 +647,7 @@ static inline int ClearTasksInPool(pool_t* pool)
     if (WaitForValue(&pool->status, POOL_STATUS_EMPTY, 1, MAX_POOL_SHUTDOWN_TIME_MS + MAX_RUNNING_TASK_TIME_MS, 1) != 0)
     {
         fprintf(stderr, "[thread_pool] ClearTasksInPool: timeout waiting for all tasks to clear\n");
-        return -1; // timeout waiting for tasks to clear
+        return -1;
     }
 
     return 0;
